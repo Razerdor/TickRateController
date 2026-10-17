@@ -4,7 +4,7 @@
 
 #include <filesystem>
 #include <fstream>
-#include <string>
+#include <iomanip>
 #include <string_view>
 #include <system_error>
 
@@ -22,34 +22,45 @@ constexpr std::string_view NORMAL_TICK_SIGNATURE =
 
 constexpr std::string_view GAME_LIBRARY = "libminecraftpe.so";
 
+enum class SpeedMode {
+    Normal,
+    TPS15,
+    TPS10,
+    TPS5
+};
+
 class TickRateController {
+private:
+    SpeedMode mode = SpeedMode::Normal;
+
+    static int targetTPS(SpeedMode selected) {
+        switch (selected) {
+            case SpeedMode::TPS15: return 15;
+            case SpeedMode::TPS10: return 10;
+            case SpeedMode::TPS5:  return 5;
+            case SpeedMode::Normal:
+            default:               return 20;
+        }
+    }
+
 public:
     bool load(pl::mod::ModContext& context) {
         auto& logger = context.logger();
 
-        logger.info("TickRate Controller diagnostic build started.");
+        logger.info("TickRate Controller loading.");
 
-        // Try to create the mod's data directory.
-        const auto dataDir = context.dataDir();
         std::error_code ec;
+        const auto dataDir = context.dataDir();
+
         std::filesystem::create_directories(dataDir, ec);
 
         const auto reportPath = dataDir / "diagnostic.txt";
         std::ofstream report(reportPath, std::ios::out | std::ios::trunc);
 
         if (!report) {
-            logger.error(
-                "Could not write diagnostic file: {}",
-                reportPath.string());
-
-            logger.error(
-                "The mod data directory may not be writable.");
-
+            logger.error("Could not write diagnostic report.");
             return true;
         }
-
-        report << "TickRate Controller diagnostic report\n";
-        report << "Minecraft library: " << GAME_LIBRARY << "\n";
 
         const auto dimensionTick =
             pl::memory::resolveSignature(
@@ -59,30 +70,43 @@ public:
             pl::memory::resolveSignature(
                 NORMAL_TICK_SIGNATURE, GAME_LIBRARY);
 
-        report << "DimensionTick: "
+        report << "TickRate Controller\n";
+        report << "Minecraft library: " << GAME_LIBRARY << "\n";
+
+        report << "DimensionTick signature: "
                << (dimensionTick ? "FOUND" : "NOT FOUND") << "\n";
 
-        report << "NormalTick: "
+        report << "NormalTick signature: "
                << (normalTick ? "FOUND" : "NOT FOUND") << "\n";
 
-        report << "DimensionTick address: 0x"
-               << std::hex << dimensionTick << "\n";
+        report << "Selected target TPS: "
+               << targetTPS(mode) << "\n";
 
-        report << "NormalTick address: 0x"
-               << std::hex << normalTick << "\n";
+        report << "Global tick hook: NOT IMPLEMENTED\n";
+        report << "Actual simulation speed: UNCHANGED\n";
 
-        report << "\nNo hooks installed; simulation speed unchanged.\n";
         report.flush();
 
-        logger.info("Diagnostic report written to: {}",
-                    reportPath.string());
+        logger.info(
+            "TickRate Controller loaded. Target: {} TPS; "
+            "global tick control is not implemented.",
+            targetTPS(mode));
 
         return true;
     }
 
-    bool enable() { return true; }
-    bool disable() { return true; }
-    bool unload() { return true; }
+    bool enable() {
+        return true;
+    }
+
+    bool disable() {
+        // No hooks have been installed, so nothing needs unhooking.
+        return true;
+    }
+
+    bool unload() {
+        return true;
+    }
 };
 
 }

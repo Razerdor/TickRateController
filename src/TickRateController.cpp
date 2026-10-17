@@ -2,7 +2,11 @@
 #include <pl/Logger.hpp>
 #include <pl/memory/Signature.hpp>
 
+#include <filesystem>
+#include <fstream>
+#include <string>
 #include <string_view>
+#include <system_error>
 
 namespace {
 
@@ -20,12 +24,32 @@ constexpr std::string_view GAME_LIBRARY = "libminecraftpe.so";
 
 class TickRateController {
 public:
-    bool load() {
-        auto& logger =
-            pl::log::Logger::getOrCreate("TickRateController");
+    bool load(pl::mod::ModContext& context) {
+        auto& logger = context.logger();
 
-        logger.info("TickRate Controller: diagnostic build started.");
-        logger.info("Checking candidate Minecraft tick functions.");
+        logger.info("TickRate Controller diagnostic build started.");
+
+        // Try to create the mod's data directory.
+        const auto dataDir = context.dataDir();
+        std::error_code ec;
+        std::filesystem::create_directories(dataDir, ec);
+
+        const auto reportPath = dataDir / "diagnostic.txt";
+        std::ofstream report(reportPath, std::ios::out | std::ios::trunc);
+
+        if (!report) {
+            logger.error(
+                "Could not write diagnostic file: {}",
+                reportPath.string());
+
+            logger.error(
+                "The mod data directory may not be writable.");
+
+            return true;
+        }
+
+        report << "TickRate Controller diagnostic report\n";
+        report << "Minecraft library: " << GAME_LIBRARY << "\n";
 
         const auto dimensionTick =
             pl::memory::resolveSignature(
@@ -35,33 +59,30 @@ public:
             pl::memory::resolveSignature(
                 NORMAL_TICK_SIGNATURE, GAME_LIBRARY);
 
-        logger.info(
-            dimensionTick
-                ? "DimensionTick signature FOUND."
-                : "DimensionTick signature NOT FOUND.");
+        report << "DimensionTick: "
+               << (dimensionTick ? "FOUND" : "NOT FOUND") << "\n";
 
-        logger.info(
-            normalTick
-                ? "NormalTick signature FOUND."
-                : "NormalTick signature NOT FOUND.");
+        report << "NormalTick: "
+               << (normalTick ? "FOUND" : "NOT FOUND") << "\n";
 
-        logger.info(
-            "Diagnostic only: simulation speed has not been changed.");
+        report << "DimensionTick address: 0x"
+               << std::hex << dimensionTick << "\n";
+
+        report << "NormalTick address: 0x"
+               << std::hex << normalTick << "\n";
+
+        report << "\nNo hooks installed; simulation speed unchanged.\n";
+        report.flush();
+
+        logger.info("Diagnostic report written to: {}",
+                    reportPath.string());
 
         return true;
     }
 
-    bool enable() {
-        return true;
-    }
-
-    bool disable() {
-        return true;
-    }
-
-    bool unload() {
-        return true;
-    }
+    bool enable() { return true; }
+    bool disable() { return true; }
+    bool unload() { return true; }
 };
 
 }

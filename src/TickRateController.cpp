@@ -1,10 +1,11 @@
 #include <pl/Mod.hpp>
 #include <pl/Logger.hpp>
+#include <pl/ModMenu.hpp>
 #include <pl/memory/Signature.hpp>
 
 #include <filesystem>
 #include <fstream>
-#include <iomanip>
+#include <string>
 #include <string_view>
 #include <system_error>
 
@@ -21,76 +22,89 @@ constexpr std::string_view NORMAL_TICK_SIGNATURE =
     "F3 03 00 AA ? ? ? F9 ? ? ? F8 ? ? ? 39";
 
 constexpr std::string_view GAME_LIBRARY = "libminecraftpe.so";
+constexpr std::string_view MODULE_ID = "tickrate_controller";
 
-enum class SpeedMode {
-    Normal,
-    TPS15,
-    TPS10,
-    TPS5
-};
+int selectedTPS = 20;
+bool moduleRegistered = false;
+
+void selectTPS(std::string_view value) {
+    if (value == "20") {
+        selectedTPS = 20;
+    } else if (value == "15") {
+        selectedTPS = 15;
+    } else if (value == "10") {
+        selectedTPS = 10;
+    } else if (value == "5") {
+        selectedTPS = 5;
+    } else if (value == "reset") {
+        selectedTPS = 20;
+    }
+}
 
 class TickRateController {
-private:
-    SpeedMode mode = SpeedMode::Normal;
-
-    static int targetTPS(SpeedMode selected) {
-        switch (selected) {
-            case SpeedMode::TPS15: return 15;
-            case SpeedMode::TPS10: return 10;
-            case SpeedMode::TPS5:  return 5;
-            case SpeedMode::Normal:
-            default:               return 20;
-        }
-    }
-
 public:
     bool load(pl::mod::ModContext& context) {
         auto& logger = context.logger();
 
         logger.info("TickRate Controller loading.");
 
-        std::error_code ec;
-        const auto dataDir = context.dataDir();
+        pl::modmenu::ModuleInfo info{};
+        info.moduleId = MODULE_ID;
+        info.displayName = "TickRate Controller";
+        info.description =
+            "Select a target simulation rate. Actual tick control is not implemented yet.";
+        info.modId = "tickrate_controller";
+        info.defaultEnabled = true;
 
-        std::filesystem::create_directories(dataDir, ec);
+        info.configs.push_back({
+            .key = "target_tps",
+            .displayName = "Target TPS",
+            .type = pl::modmenu::ConfigType::Radio,
+            .defaultValue = "20",
+        });
 
-        const auto reportPath = dataDir / "diagnostic.txt";
-        std::ofstream report(reportPath, std::ios::out | std::ios::trunc);
+        info.onConfigChanged =
+            [](std::string_view, std::string_view key,
+               std::string_view value) {
+                if (key == "target_tps") {
+                    selectTPS(value);
+                }
+            };
 
-        if (!report) {
-            logger.error("Could not write diagnostic report.");
-            return true;
+        moduleRegistered = pl::modmenu::registerModule(info);
+
+        if (!moduleRegistered) {
+            logger.error("Could not register TickRate Controller menu.");
+        } else {
+            logger.info("TickRate Controller menu registered.");
         }
 
-        const auto dimensionTick =
-            pl::memory::resolveSignature(
-                DIMENSION_TICK_SIGNATURE, GAME_LIBRARY);
+        std::error_code ec;
+        const auto dataDir = context.dataDir();
+        std::filesystem::create_directories(dataDir, ec);
 
-        const auto normalTick =
-            pl::memory::resolveSignature(
-                NORMAL_TICK_SIGNATURE, GAME_LIBRARY);
+        std::ofstream report(
+            dataDir / "diagnostic.txt",
+            std::ios::out | std::ios::trunc);
 
-        report << "TickRate Controller\n";
-        report << "Minecraft library: " << GAME_LIBRARY << "\n";
+        if (report) {
+            const auto dimensionTick =
+                pl::memory::resolveSignature(
+                    DIMENSION_TICK_SIGNATURE, GAME_LIBRARY);
 
-        report << "DimensionTick signature: "
-               << (dimensionTick ? "FOUND" : "NOT FOUND") << "\n";
+            const auto normalTick =
+                pl::memory::resolveSignature(
+                    NORMAL_TICK_SIGNATURE, GAME_LIBRARY);
 
-        report << "NormalTick signature: "
-               << (normalTick ? "FOUND" : "NOT FOUND") << "\n";
-
-        report << "Selected target TPS: "
-               << targetTPS(mode) << "\n";
-
-        report << "Global tick hook: NOT IMPLEMENTED\n";
-        report << "Actual simulation speed: UNCHANGED\n";
-
-        report.flush();
-
-        logger.info(
-            "TickRate Controller loaded. Target: {} TPS; "
-            "global tick control is not implemented.",
-            targetTPS(mode));
+            report << "TickRate Controller\n";
+            report << "DimensionTick: "
+                   << (dimensionTick ? "FOUND" : "NOT FOUND") << "\n";
+            report << "NormalTick: "
+                   << (normalTick ? "FOUND" : "NOT FOUND") << "\n";
+            report << "Selected target TPS: " << selectedTPS << "\n";
+            report << "Global tick hook: NOT IMPLEMENTED\n";
+            report << "Actual simulation speed: UNCHANGED\n";
+        }
 
         return true;
     }
@@ -100,11 +114,15 @@ public:
     }
 
     bool disable() {
-        // No hooks have been installed, so nothing needs unhooking.
         return true;
     }
 
     bool unload() {
+        if (moduleRegistered) {
+            pl::modmenu::unregisterModule(MODULE_ID);
+            moduleRegistered = false;
+        }
+
         return true;
     }
 };

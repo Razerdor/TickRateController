@@ -26,8 +26,11 @@ add_library(tick_rate_controller SHARED
     src/TickRateController.cpp
 )
 
+find_library(ANDROID_LOG_LIB log REQUIRED)
+
 target_link_libraries(tick_rate_controller PRIVATE
     preloader
+    ${ANDROID_LOG_LIB}
 )
 
 target_compile_options(tick_rate_controller PRIVATE

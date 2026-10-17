@@ -52,7 +52,8 @@ public:
         info.moduleId = MODULE_ID;
         info.displayName = "TickRate Controller";
         info.description =
-            "Select a target simulation rate. Actual tick control is not implemented yet.";
+            "Select a target simulation rate. "
+            "Actual tick control is not implemented yet.";
         info.modId = "tickrate_controller";
         info.defaultEnabled = true;
 
@@ -74,13 +75,34 @@ public:
         moduleRegistered = pl::modmenu::registerModule(info);
 
         if (!moduleRegistered) {
-            logger.error("Could not register TickRate Controller menu.");
+            logger.error(
+                "Could not register TickRate Controller menu.");
         } else {
             logger.info("TickRate Controller menu registered.");
         }
 
+        // Write menu registration status.
+        std::error_code statusEC;
+        const auto statusDir = context.dataDir();
+
+        std::filesystem::create_directories(statusDir, statusEC);
+
+        std::ofstream status(
+            statusDir / "menu_status.txt",
+            std::ios::out | std::ios::trunc);
+
+        if (status) {
+            status << "Module registration: "
+                   << (moduleRegistered ? "SUCCESS" : "FAILED")
+                   << "\n";
+        } else {
+            logger.error("Could not write menu_status.txt.");
+        }
+
+        // Write diagnostic report.
         std::error_code ec;
         const auto dataDir = context.dataDir();
+
         std::filesystem::create_directories(dataDir, ec);
 
         std::ofstream report(
@@ -97,13 +119,26 @@ public:
                     NORMAL_TICK_SIGNATURE, GAME_LIBRARY);
 
             report << "TickRate Controller\n";
+
             report << "DimensionTick: "
-                   << (dimensionTick ? "FOUND" : "NOT FOUND") << "\n";
+                   << (dimensionTick ? "FOUND" : "NOT FOUND")
+                   << "\n";
+
             report << "NormalTick: "
-                   << (normalTick ? "FOUND" : "NOT FOUND") << "\n";
-            report << "Selected target TPS: " << selectedTPS << "\n";
+                   << (normalTick ? "FOUND" : "NOT FOUND")
+                   << "\n";
+
+            report << "Selected target TPS: "
+                   << selectedTPS << "\n";
+
+            report << "Menu registration: "
+                   << (moduleRegistered ? "SUCCESS" : "FAILED")
+                   << "\n";
+
             report << "Global tick hook: NOT IMPLEMENTED\n";
             report << "Actual simulation speed: UNCHANGED\n";
+        } else {
+            logger.error("Could not write diagnostic.txt.");
         }
 
         return true;

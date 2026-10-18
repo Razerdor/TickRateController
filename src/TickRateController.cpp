@@ -54,7 +54,6 @@ public:
         info.description =
             "Select a target simulation rate. "
             "Actual tick control is not implemented yet.";
-        info.modId = "tickrate_controller";
         info.defaultEnabled = true;
 
         info.configs.push_back({

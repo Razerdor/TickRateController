@@ -19,41 +19,42 @@ public:
     }
 
     bool load() {
-        self.getLogger().info("TickRate Controller loaded.");
+        getSelf().getLogger().info(
+            "TickRate Controller loaded."
+        );
         return true;
     }
 
     bool enable() {
-        const bool registered =
-            pl::modmenu::ModuleBuilder(
-                MODULE_ID, "TickRate Controller")
-                .modId(getSelf().getId())
-                .description(
-                    "Menu registration test. "
-                    "Global tick control is not implemented.")
-                .defaultEnabled(true)
-                .config(
-                    "target_tps",
-                    "Target TPS",
-                    pl::modmenu::ConfigType::Radio,
-                    "0",
-                    "20,15,10,5,Reset")
-                .onConfigChanged(
-                    [](std::string_view,
-                       std::string_view key,
-                       std::string_view value) {
-                        if (key == "target_tps") {
-                            getSelfLogger(value);
-                        }
-                    })
-                .registerModule();
+        pl::modmenu::ModuleBuilder builder(
+            MODULE_ID,
+            "TickRate Controller"
+        );
+
+        builder
+            .modId(getSelf().getId())
+            .description(
+                "TickRate Controller menu test."
+            )
+            .defaultEnabled(true)
+            .config(
+                "target_tps",
+                "Target TPS",
+                pl::modmenu::ConfigType::Radio,
+                "20",
+                "20,15,10,5,Reset"
+            );
+
+        const bool registered = builder.registerModule();
 
         if (registered) {
             getSelf().getLogger().info(
-                "TickRate Controller menu registered.");
+                "TickRate Controller menu registered."
+            );
         } else {
             getSelf().getLogger().error(
-                "TickRate Controller menu registration failed.");
+                "TickRate Controller menu registration failed."
+            );
         }
 
         return registered;
@@ -71,10 +72,6 @@ public:
 
 private:
     ll::mod::NativeMod& self;
-
-    static void getSelfLogger(std::string_view value) {
-        (void)value;
-    }
 };
 
 }

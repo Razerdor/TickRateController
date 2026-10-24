@@ -8,33 +8,29 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <link.h>
+#include <elf.h>
 #include <mutex>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <link.h>
-#include <elf.h>
 
 namespace {
 
 constexpr const char* MODULE_ID = "tickrate_controller";
-
 constexpr uintptr_t PLAYER_NORMAL_TICK_RVA = 0x0F9E26C0;
-
 constexpr const char* EXPECTED_BUILD_ID =
     "56de9eed077631e03a31f4f58eb2f0e00071d335";
 
 std::atomic<int> targetTps{20};
-
 std::atomic<uint64_t> detourCalls{0};
 std::atomic<uint64_t> originalCalls{0};
+std::atomic<int> tickPhase{0};
+std::atomic_bool hookInstalled{false};
 
 void* originalPlayerNormalTick = nullptr;
 void* playerNormalTickAddress = nullptr;
-
-bool hookInstalled = false;
-int tickPhase = 0;
 
 std::filesystem::path diagnosticPath;
 std::mutex diagnosticMutex;
@@ -74,11 +70,12 @@ int inspectMinecraftLibrary(
     size_t,
     void* userData
 ) {
-    if (!info || !info->dlpi_name || !userData) {
-        return 0;
-    }
-
-    if (!std::strstr(info->dlpi_name, "libminecraftpe.so")) {
+    if (
+        !info ||
+        !info->dlpi_name ||
+        !userData ||
+        !std::strstr(info->dlpi_name, "libminecraftpe.so")
+    ) {
         return 0;
     }
 
@@ -163,10 +160,55 @@ int inspectMinecraftLibrary(
     return 1;
 }
 
+// Radio callback values are expected to be indices:
+//
+// 0 = 20 TPS
+// 1 = 15 TPS
+// 2 = 10 TPS
+// 3 = 5 TPS
+// 4 = Reset to 20 TPS
+//
+// Literal labels are also accepted for compatibility.
+bool parseTpsOption(
+    std::string_view value,
+    int& selected
+) {
+    if (value == "0") {
+        selected = 20;
+    } else if (value == "1") {
+        selected = 15;
+    } else if (value == "2") {
+        selected = 10;
+    } else if (value == "3") {
+        selected = 5;
+    } else if (value == "4") {
+        selected = 20;
+    } else if (value == "20" || value == "20 TPS") {
+        selected = 20;
+    } else if (value == "15" || value == "15 TPS") {
+        selected = 15;
+    } else if (value == "10" || value == "10 TPS") {
+        selected = 10;
+    } else if (value == "5" || value == "5 TPS") {
+        selected = 5;
+    } else if (
+        value == "Reset" ||
+        value == "Reset (20 TPS)"
+    ) {
+        selected = 20;
+    } else {
+        return false;
+    }
+
+    return true;
+}
+
 void playerNormalTickDetour(void* self) {
     detourCalls.fetch_add(1, std::memory_order_relaxed);
 
-    if (!originalPlayerNormalTick) {
+    void* original = originalPlayerNormalTick;
+
+    if (!original) {
         return;
     }
 
@@ -175,44 +217,69 @@ void playerNormalTickDetour(void* self) {
     );
 
     if (tps >= 20 || tps <= 0) {
-        tickPhase = 0;
+        tickPhase.store(0, std::memory_order_relaxed);
 
         reinterpret_cast<void (*)(void*)>(
-            originalPlayerNormalTick
+            original
         )(self);
 
         originalCalls.fetch_add(
-            1, std::memory_order_relaxed
+            1,
+            std::memory_order_relaxed
         );
 
         return;
     }
 
-    // Experimental player-tick throttling.
-    tickPhase += tps;
+    // Experimental player-only throttling.
+    // This does not control the entire Minecraft world tick.
 
-    if (tickPhase < 20) {
-        return;
+    int phase = tickPhase.load(std::memory_order_relaxed);
+
+    for (;;) {
+        int next = phase + tps;
+        const bool shouldRun = next >= 20;
+
+        if (shouldRun) {
+            next -= 20;
+        }
+
+        if (tickPhase.compare_exchange_weak(
+                phase,
+                next,
+                std::memory_order_relaxed,
+                std::memory_order_relaxed
+            )) {
+            if (!shouldRun) {
+                return;
+            }
+
+            break;
+        }
     }
 
-    tickPhase -= 20;
-
     reinterpret_cast<void (*)(void*)>(
-        originalPlayerNormalTick
+        original
     )(self);
 
     originalCalls.fetch_add(
-        1, std::memory_order_relaxed
+        1,
+        std::memory_order_relaxed
     );
 }
 
 bool installPlayerHook(ll::mod::NativeMod& mod) {
     auto& logger = mod.getLogger();
 
-    writeDiagnosticLine("[CHECK] Hook installation started.");
+    writeDiagnosticLine(
+        "[CHECK] Hook installation started."
+    );
 
-    if (hookInstalled) {
-        writeDiagnosticLine("[INFO] Hook was already installed.");
+    if (hookInstalled.load(std::memory_order_relaxed)) {
+        writeDiagnosticLine(
+            "[INFO] Hook was already installed."
+        );
+
         return true;
     }
 
@@ -237,7 +304,9 @@ bool installPlayerHook(ll::mod::NativeMod& mod) {
 
     writeDiagnosticLine(
         "[OK] Minecraft library found. Base=" +
-        pointerToHex(reinterpret_cast<void*>(library.base))
+        pointerToHex(
+            reinterpret_cast<void*>(library.base)
+        )
     );
 
     writeDiagnosticLine(
@@ -297,11 +366,12 @@ bool installPlayerHook(ll::mod::NativeMod& mod) {
         return false;
     }
 
-    hookInstalled = true;
-    tickPhase = 0;
+    tickPhase.store(0, std::memory_order_relaxed);
 
     detourCalls.store(0, std::memory_order_relaxed);
     originalCalls.store(0, std::memory_order_relaxed);
+
+    hookInstalled.store(true, std::memory_order_relaxed);
 
     writeDiagnosticLine(
         "[OK] Hook installation succeeded."
@@ -315,7 +385,7 @@ bool installPlayerHook(ll::mod::NativeMod& mod) {
 }
 
 void removePlayerHook(ll::mod::NativeMod& mod) {
-    if (!hookInstalled) {
+    if (!hookInstalled.load(std::memory_order_relaxed)) {
         return;
     }
 
@@ -325,18 +395,24 @@ void removePlayerHook(ll::mod::NativeMod& mod) {
     );
 
     if (removed) {
-        writeDiagnosticLine("[INFO] Hook removed successfully.");
+        writeDiagnosticLine(
+            "[INFO] Hook removed successfully."
+        );
 
-        hookInstalled = false;
+        hookInstalled.store(false, std::memory_order_relaxed);
+
         playerNormalTickAddress = nullptr;
         originalPlayerNormalTick = nullptr;
-        tickPhase = 0;
+
+        tickPhase.store(0, std::memory_order_relaxed);
 
         mod.getLogger().info(
             "TickRate Controller: player-tick hook removed."
         );
     } else {
-        writeDiagnosticLine("[FAIL] Hook removal failed.");
+        writeDiagnosticLine(
+            "[FAIL] Hook removal failed."
+        );
 
         mod.getLogger().error(
             "TickRate Controller: failed to remove player-tick hook."
@@ -375,10 +451,20 @@ public:
             if (out) {
                 out << "=== TickRateController Diagnostics ===\n";
                 out << "Expected Minecraft version: 1.26.52.3\n";
+
                 out << "Expected Build ID: "
                     << EXPECTED_BUILD_ID << '\n';
+
                 out << "Hook RVA: 0xF9E26C0\n";
+
+                out << "Radio mapping: "
+                    << "0=20, 1=15, 2=10, 3=5, 4=Reset/20\n";
+
+                out << "Scope: player normalTick only; "
+                    << "not full-world TPS\n";
+
                 out << "Mod load stage: OK\n";
+
                 out.flush();
             }
         }
@@ -417,17 +503,20 @@ public:
         builder
             .modId(getSelf().getId())
             .description(
-                "Experimental player-tick throttling. "
-                "Does not change full-world TPS."
+                "Experimental player-tick throttling only. "
+                "Does not change full-world or server TPS."
             )
             .defaultEnabled(true)
+
+            // Radio values are option indices, not the displayed labels.
             .config(
                 "target_tps",
                 "Target TPS",
                 pl::modmenu::ConfigType::Radio,
-                "20",
-                "20,15,10,5,Reset"
+                "0",
+                "20 TPS,15 TPS,10 TPS,5 TPS,Reset (20 TPS)"
             )
+
             .onConfigChanged(
                 [this](
                     std::string_view moduleId,
@@ -441,20 +530,17 @@ public:
                         return;
                     }
 
+                    writeDiagnosticLine(
+                        "[CONFIG] Raw radio value=[" +
+                        std::string(value) + "]"
+                    );
+
                     int selected = 20;
 
-                    if (value == "15") {
-                        selected = 15;
-                    } else if (value == "10") {
-                        selected = 10;
-                    } else if (value == "5") {
-                        selected = 5;
-                    } else if (
-                        value != "20" &&
-                        value != "Reset"
-                    ) {
+                    if (!parseTpsOption(value, selected)) {
                         writeDiagnosticLine(
-                            "[WARN] Unknown TPS option received."
+                            "[WARN] Unknown TPS option value=[" +
+                            std::string(value) + "]"
                         );
 
                         return;
@@ -465,6 +551,11 @@ public:
                         std::memory_order_relaxed
                     );
 
+                    tickPhase.store(
+                        0,
+                        std::memory_order_relaxed
+                    );
+
                     writeDiagnosticLine(
                         "[CONFIG] Selected TPS=" +
                         std::to_string(selected)
@@ -472,7 +563,13 @@ public:
 
                     writeDiagnosticLine(
                         std::string("[STATUS] Hook installed: ") +
-                        (hookInstalled ? "YES" : "NO")
+                        (
+                            hookInstalled.load(
+                                std::memory_order_relaxed
+                            )
+                                ? "YES"
+                                : "NO"
+                        )
                     );
 
                     writeDiagnosticLine(
@@ -509,7 +606,9 @@ public:
             return false;
         }
 
-        writeDiagnosticLine("[OK] Menu registered.");
+        writeDiagnosticLine(
+            "[OK] Menu registered."
+        );
 
         getSelf().getLogger().info(
             "TickRate Controller menu registered."
@@ -530,7 +629,7 @@ public:
 
         pl::modmenu::unregisterModule(MODULE_ID);
 
-        return !hookInstalled;
+        return !hookInstalled.load(std::memory_order_relaxed);
     }
 
     bool unload() {
@@ -538,13 +637,13 @@ public:
 
         pl::modmenu::unregisterModule(MODULE_ID);
 
-        return !hookInstalled;
+        return !hookInstalled.load(std::memory_order_relaxed);
     }
 
 private:
     ll::mod::NativeMod& self;
 };
 
-}
+} // namespace
 
 PL_REGISTER_MOD(TickRateController, TickRateController{});

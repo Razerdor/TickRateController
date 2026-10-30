@@ -4,6 +4,7 @@
 #include <pl/memory/Hook.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -15,6 +16,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 
 namespace {
 
@@ -203,8 +205,70 @@ bool parseTpsOption(
     return true;
 }
 
+// ---------------------------------------------------------------
+// DIAGNOSTIC: once-per-second rate reporter.
+// Writes [RATE] lines to diagnostic.txt so we can see how often
+// the detour really fires and whether `self` is one object or many.
+// ---------------------------------------------------------------
+std::atomic<void*> lastSelf{nullptr};
+std::atomic<uint64_t> selfChanges{0};
+std::atomic_bool reporterRun{false};
+std::thread reporterThread;
+
+void startReporter() {
+    if (reporterRun.exchange(true)) {
+        return;
+    }
+
+    reporterThread = std::thread([] {
+        uint64_t lastD = 0;
+        uint64_t lastO = 0;
+        uint64_t lastS = 0;
+
+        while (reporterRun.load()) {
+            std::this_thread::sleep_for(
+                std::chrono::seconds(1)
+            );
+
+            if (!reporterRun.load()) {
+                break;
+            }
+
+            const uint64_t d = detourCalls.load();
+            const uint64_t o = originalCalls.load();
+            const uint64_t s = selfChanges.load();
+
+            writeDiagnosticLine(
+                "[RATE] tps=" +
+                std::to_string(targetTps.load()) +
+                " detour/s=" + std::to_string(d - lastD) +
+                " original/s=" + std::to_string(o - lastO) +
+                " selfChanges/s=" + std::to_string(s - lastS) +
+                " lastSelf=" + pointerToHex(lastSelf.load())
+            );
+
+            lastD = d;
+            lastO = o;
+            lastS = s;
+        }
+    });
+}
+
+void stopReporter() {
+    reporterRun.store(false);
+
+    if (reporterThread.joinable()) {
+        reporterThread.join();
+    }
+}
+
 void playerNormalTickDetour(void* self) {
     detourCalls.fetch_add(1, std::memory_order_relaxed);
+
+    // DIAGNOSTIC: track whether `self` changes between calls.
+    if (lastSelf.exchange(self, std::memory_order_relaxed) != self) {
+        selfChanges.fetch_add(1, std::memory_order_relaxed);
+    }
 
     void* original = originalPlayerNormalTick;
 
@@ -370,8 +434,13 @@ bool installPlayerHook(ll::mod::NativeMod& mod) {
 
     detourCalls.store(0, std::memory_order_relaxed);
     originalCalls.store(0, std::memory_order_relaxed);
+    selfChanges.store(0, std::memory_order_relaxed);
+    lastSelf.store(nullptr, std::memory_order_relaxed);
 
     hookInstalled.store(true, std::memory_order_relaxed);
+
+    // DIAGNOSTIC: start once-per-second [RATE] logging.
+    startReporter();
 
     writeDiagnosticLine(
         "[OK] Hook installation succeeded."
@@ -388,6 +457,9 @@ void removePlayerHook(ll::mod::NativeMod& mod) {
     if (!hookInstalled.load(std::memory_order_relaxed)) {
         return;
     }
+
+    // DIAGNOSTIC: stop the reporter before unhooking.
+    stopReporter();
 
     const bool removed = pl::memory::unhook(
         playerNormalTickAddress,

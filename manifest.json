@@ -2,10 +2,11 @@
   "type": "preload-native",
   "name": "TickRate Controller",
   "author": "Razerdor",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "entry": "libtick_rate_controller.so",
   "minecraft_versions": [
-    "1.26.52.3"
+    "1.26.52.3",
+    "1.26.60.4"
   ],
   "overwrite_files": [],
   "overwrite_folders": []

@@ -17,13 +17,32 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <utility>
+#include <vector>
 
 namespace {
 
 constexpr const char* MODULE_ID = "tickrate_controller";
-constexpr uintptr_t PLAYER_NORMAL_TICK_RVA = 0x0F9E26C0;
+
+// Legacy values for 1.26.52.3. Only used as a tie-breaker / info now.
+constexpr uintptr_t LEGACY_RVA = 0x0F9E26C0;
 constexpr const char* EXPECTED_BUILD_ID =
     "56de9eed077631e03a31f4f58eb2f0e00071d335";
+
+// Fingerprint of the function prologue found at 0xF9E26C0 in 1.26.52.3.
+// All 8 instructions are position independent (no relative branches).
+constexpr uint32_t SIGNATURE[] = {
+    0xd100c3ff,  // sub sp, sp, #0x30
+    0xa9017bfd,  // stp x29, x30, [sp, #0x10]
+    0xa9024ff4,  // stp x20, x19, [sp, #0x20]
+    0x910043fd,  // add x29, sp, #0x10
+    0xd53bd054,  // mrs x20, TPIDR_EL0
+    0xaa0003f3,  // mov x19, x0
+    0xf9401688,  // ldr x8, [x20, #0x28]
+    0xf90007e8,  // str x8, [sp, #0x8]
+};
+constexpr size_t SIGNATURE_WORDS =
+    sizeof(SIGNATURE) / sizeof(SIGNATURE[0]);
 
 std::atomic<int> targetTps{20};
 std::atomic<uint64_t> detourCalls{0};
@@ -61,10 +80,22 @@ std::string pointerToHex(const void* ptr) {
     return out.str();
 }
 
+std::string numberToHex(uint64_t value) {
+    std::ostringstream out;
+
+    out << "0x" << std::hex << value;
+
+    return out.str();
+}
+
 struct MinecraftLibraryInfo {
     uintptr_t base = 0;
     bool found = false;
     bool buildIdMatches = false;
+    std::string buildId;
+
+    // (runtime address, size in bytes) of executable segments.
+    std::vector<std::pair<uintptr_t, size_t>> execSegments;
 };
 
 int inspectMinecraftLibrary(
@@ -87,6 +118,21 @@ int inspectMinecraftLibrary(
     result->base = static_cast<uintptr_t>(info->dlpi_addr);
     result->found = true;
 
+    // Collect executable load segments for the signature scan.
+    for (ElfW(Half) i = 0; i < info->dlpi_phnum; ++i) {
+        const auto& phdr = info->dlpi_phdr[i];
+
+        if (phdr.p_type == PT_LOAD && (phdr.p_flags & PF_X)) {
+            result->execSegments.emplace_back(
+                static_cast<uintptr_t>(
+                    info->dlpi_addr + phdr.p_vaddr
+                ),
+                static_cast<size_t>(phdr.p_filesz)
+            );
+        }
+    }
+
+    // Read the GNU build ID (informational only).
     for (ElfW(Half) i = 0; i < info->dlpi_phnum; ++i) {
         const auto& phdr = info->dlpi_phdr[i];
 
@@ -147,6 +193,8 @@ int inspectMinecraftLibrary(
                         hexDigits[desc[j] & 0x0F];
                 }
 
+                result->buildId = buildId;
+
                 result->buildIdMatches =
                     std::string_view(buildId) ==
                     EXPECTED_BUILD_ID;
@@ -160,6 +208,49 @@ int inspectMinecraftLibrary(
     }
 
     return 1;
+}
+
+// Scans the loaded executable segments for SIGNATURE.
+// Returns RVAs (offset from library base) of every match, max 16.
+std::vector<uintptr_t> scanForSignature(
+    const MinecraftLibraryInfo& library
+) {
+    std::vector<uintptr_t> hits;
+
+    for (const auto& segment : library.execSegments) {
+        const auto* words =
+            reinterpret_cast<const uint32_t*>(segment.first);
+
+        const size_t count = segment.second / sizeof(uint32_t);
+
+        if (count < SIGNATURE_WORDS) {
+            continue;
+        }
+
+        for (size_t i = 0; i + SIGNATURE_WORDS <= count; ++i) {
+            if (words[i] != SIGNATURE[0]) {
+                continue;
+            }
+
+            if (std::memcmp(
+                    words + i,
+                    SIGNATURE,
+                    sizeof(SIGNATURE)
+                ) == 0) {
+                hits.push_back(
+                    segment.first +
+                    i * sizeof(uint32_t) -
+                    library.base
+                );
+
+                if (hits.size() >= 16) {
+                    return hits;
+                }
+            }
+        }
+    }
+
+    return hits;
 }
 
 // Radio callback values are expected to be indices:
@@ -207,8 +298,6 @@ bool parseTpsOption(
 
 // ---------------------------------------------------------------
 // DIAGNOSTIC: once-per-second rate reporter.
-// Writes [RATE] lines to diagnostic.txt so we can see how often
-// the detour really fires and whether `self` is one object or many.
 // ---------------------------------------------------------------
 std::atomic<void*> lastSelf{nullptr};
 std::atomic<uint64_t> selfChanges{0};
@@ -374,24 +463,90 @@ bool installPlayerHook(ll::mod::NativeMod& mod) {
     );
 
     writeDiagnosticLine(
-        std::string("[CHECK] Build ID matches: ") +
-        (library.buildIdMatches ? "YES" : "NO")
+        "[INFO] Build ID (running game)=" + library.buildId
     );
 
-    if (!library.buildIdMatches) {
+    writeDiagnosticLine(
+        std::string("[INFO] Build ID matches 1.26.52.3: ") +
+        (library.buildIdMatches ? "YES" : "NO") +
+        " (no longer blocks the hook)"
+    );
+
+    writeDiagnosticLine(
+        "[INFO] Executable segments=" +
+        std::to_string(library.execSegments.size())
+    );
+
+    // ---- Runtime signature scan ----
+    const std::vector<uintptr_t> hits =
+        scanForSignature(library);
+
+    writeDiagnosticLine(
+        "[SCAN] Signature hits=" + std::to_string(hits.size())
+    );
+
+    for (uintptr_t rva : hits) {
+        uint32_t next[8]{};
+
+        std::memcpy(
+            next,
+            reinterpret_cast<const void*>(
+                library.base + rva + sizeof(SIGNATURE)
+            ),
+            sizeof(next)
+        );
+
+        std::ostringstream line;
+
+        line << "[SCAN] hit RVA=" << numberToHex(rva)
+             << " next words:" << std::hex;
+
+        for (uint32_t w : next) {
+            line << ' ' << w;
+        }
+
+        writeDiagnosticLine(line.str());
+    }
+
+    uintptr_t chosenRva = 0;
+    bool haveTarget = false;
+
+    if (library.buildIdMatches) {
+        for (uintptr_t rva : hits) {
+            if (rva == LEGACY_RVA) {
+                chosenRva = rva;
+                haveTarget = true;
+                break;
+            }
+        }
+    }
+
+    if (!haveTarget && hits.size() == 1) {
+        chosenRva = hits[0];
+        haveTarget = true;
+    }
+
+    if (!haveTarget) {
         writeDiagnosticLine(
-            "[FAIL] Build ID mismatch. Hook skipped."
+            hits.empty()
+                ? "[FAIL] Signature not found in this build. Hook skipped."
+                : "[FAIL] Multiple signature hits; refusing to guess. "
+                  "Hook skipped."
         );
 
         logger.error(
-            "TickRate Controller: Build ID mismatch."
+            "TickRate Controller: could not resolve player tick."
         );
 
         return false;
     }
 
+    writeDiagnosticLine(
+        "[SCAN] Chosen RVA=" + numberToHex(chosenRva)
+    );
+
     playerNormalTickAddress = reinterpret_cast<void*>(
-        library.base + PLAYER_NORMAL_TICK_RVA
+        library.base + chosenRva
     );
 
     writeDiagnosticLine(
@@ -522,12 +677,12 @@ public:
 
             if (out) {
                 out << "=== TickRateController Diagnostics ===\n";
-                out << "Expected Minecraft version: 1.26.52.3\n";
+                out << "Build: runtime signature scan (version independent)\n";
 
-                out << "Expected Build ID: "
+                out << "Legacy Build ID (1.26.52.3): "
                     << EXPECTED_BUILD_ID << '\n';
 
-                out << "Hook RVA: 0xF9E26C0\n";
+                out << "Legacy RVA: 0xF9E26C0\n";
 
                 out << "Radio mapping: "
                     << "0=20, 1=15, 2=10, 3=5, 4=Reset/20\n";
@@ -634,88 +789,4 @@ public:
                     );
 
                     writeDiagnosticLine(
-                        std::string("[STATUS] Hook installed: ") +
-                        (
-                            hookInstalled.load(
-                                std::memory_order_relaxed
-                            )
-                                ? "YES"
-                                : "NO"
-                        )
-                    );
-
-                    writeDiagnosticLine(
-                        "[RUNTIME SNAPSHOT] Detour calls=" +
-                        std::to_string(
-                            detourCalls.load(
-                                std::memory_order_relaxed
-                            )
-                        ) +
-                        ", original calls=" +
-                        std::to_string(
-                            originalCalls.load(
-                                std::memory_order_relaxed
-                            )
-                        )
-                    );
-
-                    getSelf().getLogger().info(
-                        "Selected experimental player tick rate: {}",
-                        selected
-                    );
-                }
-            );
-
-        if (!builder.registerModule()) {
-            writeDiagnosticLine(
-                "[FAIL] Menu registration failed."
-            );
-
-            getSelf().getLogger().error(
-                "TickRate Controller menu registration failed."
-            );
-
-            return false;
-        }
-
-        writeDiagnosticLine(
-            "[OK] Menu registered."
-        );
-
-        getSelf().getLogger().info(
-            "TickRate Controller menu registered."
-        );
-
-        const bool installed = installPlayerHook(getSelf());
-
-        writeDiagnosticLine(
-            std::string("[RESULT] Hook status: ") +
-            (installed ? "SUCCESS" : "FAILED")
-        );
-
-        return installed;
-    }
-
-    bool disable() {
-        removePlayerHook(getSelf());
-
-        pl::modmenu::unregisterModule(MODULE_ID);
-
-        return !hookInstalled.load(std::memory_order_relaxed);
-    }
-
-    bool unload() {
-        removePlayerHook(getSelf());
-
-        pl::modmenu::unregisterModule(MODULE_ID);
-
-        return !hookInstalled.load(std::memory_order_relaxed);
-    }
-
-private:
-    ll::mod::NativeMod& self;
-};
-
-} // namespace
-
-PL_REGISTER_MOD(TickRateController, TickRateController{});
+                        std::st
